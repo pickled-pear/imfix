@@ -1,0 +1,17 @@
+[project]
+name = "imfix"
+version = "0.1.0"
+description = "Batch-edit image metadata with exiftool: tags, dates, authors, copyright, renaming and compression."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["click>=8.1"]
+
+[project.scripts]
+imfix = "imfix.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
