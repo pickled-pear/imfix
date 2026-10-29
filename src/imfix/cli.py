@@ -4,22 +4,28 @@ from __future__ import annotations
 
 import functools
 import os
+import shutil
 import subprocess
 import sys
 import uuid
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 import click
 
 from imfix import __version__
+from imfix.compress import DEFAULT_AUDIO_BITRATE, PRESETS, VIDEO_CODECS, Settings, kind_of
 from imfix.dates import date_from_filename, parse_exif_date, to_exif
 from imfix.exiftool import ExifTool, find
 from imfix.files import (
-    COMPRESS_EXTS,
+    AUDIO_EXTS,
+    IMAGE_EXTS,
+    MEDIA_EXTS,
     METADATA_EXTS,
+    TEMP_PREFIX,
+    VIDEO_EXTS,
     FileTimes,
+    WorkingCopy,
     best_file_date,
     collect,
     copy_file,
@@ -33,7 +39,28 @@ DATE_TAGS = ["DateTimeOriginal", "CreateDate", "DateCreated"]
 
 RENAME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
+# Characters Windows doesn't allow in filenames.
+BAD_NAME_CHARS = set('<>:"/\\|?*')
+
 CONTEXT = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
+
+_WORKING_COPY_STEPS = f"""How DIR is used: the first command run on DIR copies all its images, audio
+and video into DIR/{DEFAULT_OUTPUT} (the working copy, or the --output folder) and
+changes the copies. Every later command on the same DIR changes those same
+copies, so commands build on each other, e.g. "imfix rename ." then
+"imfix compress .". The originals are never changed. --fresh deletes the
+working copy and copies the originals again, which is also how to pick up
+files added to DIR later. Only the first command's --recurse decides whether
+subfolders are copied."""
+
+# Shown at the end of each command's --help.
+WORKING_COPY_EPILOG = _WORKING_COPY_STEPS + """
+
+--in-place skips the working copy and changes the originals in DIR directly."""
+
+COMPRESS_EPILOG = _WORKING_COPY_STEPS + """
+
+compress has no --in-place, so it always works on the working copy."""
 
 
 # --------------------------------------------------------------------------------------------
@@ -42,40 +69,91 @@ CONTEXT = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 
 
 class Run:
-    """The options every subcommand shares, plus helpers for output and destinations."""
+    """The options every subcommand shares, and the folder the command works on."""
 
-    def __init__(self, directory: Path, output: Path | None, in_place: bool, recurse: bool, verbose: bool, dry_run: bool):
+    def __init__(self, directory: Path, output: Path | None, in_place: bool, fresh: bool,
+                 recurse: bool, verbose: bool, dry_run: bool):
         if in_place and output is not None:
             raise click.UsageError("--output and --in-place can't be used together.")
+        if in_place and fresh:
+            raise click.UsageError("--fresh and --in-place can't be used together.")
         self.input = directory.resolve()
         self.in_place = in_place
-        self.output = None if in_place else (output.resolve() if output else self.input / DEFAULT_OUTPUT)
+        self.custom_output = output is not None
+        self.working = None if in_place else WorkingCopy(output.resolve() if output else self.input / DEFAULT_OUTPUT)
+        self.fresh = fresh
         self.recurse = recurse
         self.verbose = verbose
         self.dry_run = dry_run
+        self._root: Path | None = None
+
+    @property
+    def root(self) -> Path:
+        """The folder whose files get changed: the working copy, or DIR itself with --in-place.
+
+        The first time this is used, the working copy is filled with copies of the originals.
+        """
+        if self._root is None:
+            self._root = self._prepare()
+        return self._root
+
+    def _prepare(self) -> Path:
+        wc = self.working
+        if wc is None:
+            return self.input
+
+        if wc.has_files() and not wc.marked and self.custom_output:
+            raise click.ClickException(
+                f"{wc.root} already has files in it that imfix didn't put there. Choose an empty folder for --output."
+            )
+
+        if wc.has_files() and self.fresh:
+            if self.dry_run:
+                self.info(f"Would delete the working copy in {wc.root} and start again from the originals.")
+                return self.input
+            shutil.rmtree(wc.root)
+            self.working = wc = WorkingCopy(wc.root)
+            self.info("Deleted the old working copy.")
+
+        if wc.has_files():
+            self.info(f"Working on the copies in {wc.root} (add --fresh to start again from the originals).")
+            originals = collect(self.input, self.recurse, MEDIA_EXTS, exclude=wc.root)
+            copies = collect(wc.root, self.recurse, MEDIA_EXTS, exclude=None)
+            if len(originals) > len(copies):
+                self.warn(f"{len(originals) - len(copies)} more file(s) in {self.input} than in the working copy. "
+                          "New files aren't added automatically: use --fresh to include them.")
+            return wc.root
+
+        sources = collect(self.input, self.recurse, MEDIA_EXTS, exclude=wc.root)
+        if self.dry_run:
+            if sources:
+                self.info(f"Would copy {len(sources)} file(s) to {wc.root} and change the copies.")
+            return self.input
+        for src in sources:
+            copy_file(src, wc.root / src.relative_to(self.input))
+        if sources:
+            wc.save()
+            self.info(f"Copied {len(sources)} file(s) to {wc.root}")
+        return wc.root
 
     def files(self, exts: set[str]) -> list[Path]:
-        files = collect(self.input, self.recurse, exts, exclude=self.output)
+        root = self.root
+        exclude = self.working.root if self.working and root == self.input else None
+        files = collect(root, self.recurse, exts, exclude=exclude)
         if not files:
             where = "in or below" if self.recurse else "in"
-            self.info(f"No matching files found {where} {self.input}")
-        elif self.verbose:
-            self.info(f"Found {len(files)} file(s) in {self.input}")
+            self.info(f"No matching files found {where} {root}")
+        else:
+            self.detail(f"Found {len(files)} file(s) in {root}")
         return files
-
-    def destination_dir(self, src: Path) -> Path:
-        if self.in_place:
-            return src.parent
-        return self.output / src.parent.relative_to(self.input)
 
     def show(self, path: Path) -> str:
         """A short form of `path` for messages."""
-        for base in (self.input, self.output):
-            if base is not None:
-                try:
-                    return str(path.relative_to(base))
-                except ValueError:
-                    pass
+        for base in (self.root, self.input):
+            try:
+                return str(path.relative_to(base))
+            except ValueError:
+                pass
         return str(path)
 
     def info(self, message: str) -> None:
@@ -92,13 +170,14 @@ class Run:
         click.echo(click.style(message, fg="red"), err=True)
 
     def summary(self, parts: dict[str, int]) -> None:
-        text = ", ".join(f"{count} {label}" for label, count in parts.items() if count or label == next(iter(parts)))
+        first = next(iter(parts))
+        text = ", ".join(f"{count} {label}" for label, count in parts.items() if count or label == first)
         if self.dry_run:
             self.info(f"Dry run: {text}. Nothing was changed.")
-        elif self.in_place:
+        elif self.working is None:
             self.info(f"Done: {text}.")
         else:
-            self.info(f"Done: {text}. Output in {self.output}")
+            self.info(f"Done: {text}. Results in {self.working.root}")
 
 
 def common_options(in_place: bool = True):
@@ -106,24 +185,29 @@ def common_options(in_place: bool = True):
 
     def decorator(f):
         @functools.wraps(f)
-        def wrapper(directory, output, recurse, verbose, dry_run, in_place=False, **kwargs):
-            run = Run(directory, output, in_place, recurse, verbose, dry_run)
+        def wrapper(directory, output, fresh, recurse, verbose, dry_run, in_place=False, **kwargs):
+            run = Run(directory, output, in_place, fresh, recurse, verbose, dry_run)
             return f(run, **kwargs)
 
         options = [
             click.argument("directory", metavar="DIR", type=click.Path(exists=True, file_okay=False, path_type=Path)),
-            click.option("-r", "--recurse", is_flag=True, help="Include files in subfolders."),
+            click.option("-r", "--recurse", is_flag=True,
+                         help="Include subfolders. When the working copy is first made, this decides "
+                              "whether subfolders are copied into it."),
             click.option("-v", "--verbose", is_flag=True, help="Show every file and the commands being run."),
             click.option("-n", "--dry-run", is_flag=True, help="Show what would happen without changing anything."),
             click.option(
                 "-o", "--output", metavar="FOLDER", type=click.Path(file_okay=False, path_type=Path),
-                help=f'Folder for the results. Default: an "{DEFAULT_OUTPUT}" folder inside DIR.',
+                help=f'Folder to use as the working copy. Default: an "{DEFAULT_OUTPUT}" folder inside DIR. '
+                     "Give the same folder on every command.",
             ),
+            click.option("--fresh", is_flag=True,
+                         help="Delete the working copy (and every change made to it) and copy the originals again."),
         ]
         if in_place:
             options.append(click.option(
                 "-i", "--in-place", is_flag=True,
-                help="Change the original files instead of writing copies to the output folder.",
+                help="Change the original files in DIR directly, without a working copy.",
             ))
         for option in reversed(options):
             wrapper = option(wrapper)
@@ -140,57 +224,36 @@ def iptc_charset(values) -> list[str]:
 
 
 def apply_metadata(run: Run, plans: list[tuple[Path, list[str] | None]], did: str, would: str) -> None:
-    """Copy files to the output folder (unless --in-place) and apply exiftool arguments to them.
-
-    `plans` holds (file, exiftool arguments). Files with None as arguments are copied unchanged,
-    so the output folder still ends up with the full set of images.
-    """
+    """Apply each file's exiftool arguments to it. Files with None as arguments are left alone."""
     done_label = f"would be {did}" if run.dry_run else did
-    counts = {done_label: 0, "unchanged": 0, "skipped": 0, "failed": 0}
+    counts = {done_label: 0, "unchanged": 0, "failed": 0}
 
-    staged = []  # (src, dst, args, times)
-    for src, args in plans:
-        dst = run.destination_dir(src) / src.name
-
-        if not run.in_place and dst.exists():
-            run.warn(f"Skipping {run.show(src)}: already in the output folder.")
-            counts["skipped"] += 1
-            continue
-
+    staged = []  # (path, args, times)
+    for path, args in plans:
         if args is None:
             counts["unchanged"] += 1
-            if not run.in_place and not run.dry_run:
-                copy_file(src, dst)
-            continue
-
-        if run.dry_run:
+        elif run.dry_run:
             counts[done_label] += 1
-            run.info(f"Would {would} {run.show(src)}")
+            run.info(f"Would {would} {run.show(path)}")
             run.detail(f"    exiftool {' '.join(args)}")
-            continue
-
-        times = FileTimes.of(src)
-        if not run.in_place:
-            copy_file(src, dst)
-        staged.append((src, dst, args, times))
+        else:
+            staged.append((path, args, FileTimes.of(path)))
 
     if staged:
-        problems = ExifTool(run.verbose).write([(dst, args) for _, dst, args, _ in staged])
-        for src, dst, args, times in staged:
-            messages = problems.get(dst, [])
+        problems = ExifTool(run.verbose).write([(path, args) for path, args, _ in staged])
+        for path, args, times in staged:
+            messages = problems.get(path, [])
             errors = [m for m in messages if m.startswith("Error")]
             if errors:
                 counts["failed"] += 1
-                run.error(f"Failed: {run.show(src)}")
+                run.error(f"Failed: {run.show(path)}")
                 for message in errors:
                     run.error(f"    {message}")
-                if not run.in_place:
-                    dst.unlink(missing_ok=True)
                 continue
 
-            times.apply(dst)
+            times.apply(path)
             counts[did] += 1
-            run.detail(f"{did.capitalize()}: {run.show(src)}")
+            run.detail(f"{did.capitalize()}: {run.show(path)}")
             for message in messages:
                 run.detail(f"    {message}")
 
@@ -208,24 +271,35 @@ def apply_metadata(run: Run, plans: list[tuple[Path, list[str] | None]], did: st
 def cli(ctx: click.Context):
     """imfix - batch-edit image metadata with exiftool.
 
+    Every command works on the files in DIR. Use "." for the current folder.
+
     \b
-    Every command works on all images in DIR. Use "." for the current folder.
-    Results go to an "imfix" folder inside DIR, so the originals are never
-    changed unless you pass --in-place.
+    Running several commands in a row:
+      1. The first command copies all the images, audio and video in DIR into
+         DIR/imfix (the "working copy") and changes the copies.
+      2. Every later command on the same DIR changes those same copies, so
+         each one builds on the last: rename, then compress, then tag...
+      3. The originals are never changed. Add --fresh to any command to
+         delete the working copy and copy the originals again (do this to
+         pick up files added to DIR later, or to undo everything).
+    --in-place skips the working copy and changes the originals directly.
+    Only the first command's --recurse decides whether subfolders are copied.
 
     \b
     Every command accepts:
       -r, --recurse    include subfolders
       -v, --verbose    show every file and the commands being run
       -n, --dry-run    show what would happen without changing anything
-      -o, --output     choose the output folder
+      -o, --output     use another folder as the working copy
+      --fresh          delete the working copy and start again
+      -i, --in-place   change the originals (all commands except compress)
 
     \b
-    Examples:
-      imfix tag . holiday "Côte d'Azur"     add two tags to every image here
-      imfix date . -r                       set missing dates from filenames
-      imfix rename "D:\\Photos\\2025" -n      preview the new names
-      imfix compress . --format webp        compress images to WebP
+    Examples (the first three run in order, each building on the last):
+      imfix date .                          set missing dates from filenames
+      imfix rename . --prefix trip          rename to trip_2025-01-01_...
+      imfix compress .                      compress them all
+      imfix tag . holiday --fresh           start again, just add a tag
       imfix author . "Jane Smith" -i        change the originals directly
 
     Run "imfix COMMAND --help" for details on a command.
@@ -234,11 +308,12 @@ def cli(ctx: click.Context):
         click.echo(ctx.get_help())
 
 
-@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Add tags to every image.")
+@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Add tags to every image.",
+             epilog=WORKING_COPY_EPILOG)
 @common_options()
 @click.argument("tags", nargs=-1, required=True)
 def tag(run: Run, tags: tuple[str, ...]):
-    """Add one or more TAGS to every image in DIR.
+    """Add one or more TAGS to every image.
 
     Tags are added to any existing ones (duplicates are skipped) and are written as XMP and IPTC
     keywords, so they show up as Tags in Windows Explorer, Lightroom, digiKam and similar.
@@ -257,7 +332,8 @@ def tag(run: Run, tags: tuple[str, ...]):
         apply_metadata(run, [(f, args) for f in files], did="tagged", would="tag")
 
 
-@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Set missing dates taken from the filenames.")
+@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Set missing dates taken from the filenames.",
+             epilog=WORKING_COPY_EPILOG)
 @common_options()
 def date(run: Run):
     """Set the date taken from the filename, for images that don't have one.
@@ -299,26 +375,44 @@ def date(run: Run):
     apply_metadata(run, plans, did="dated", would="date")
 
 
-@cli.command("strip-copyright", context_settings=CONTEXT, no_args_is_help=True, short_help="Remove all copyright info.")
+@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Set or remove the copyright.",
+             epilog=WORKING_COPY_EPILOG)
 @common_options()
-def strip_copyright(run: Run):
-    """Remove all copyright and usage-rights information from every image in DIR.
+@click.argument("text", required=False)
+@click.option("--none", "clear", is_flag=True, help="Remove all copyright info instead of setting it.")
+def copyright(run: Run, text: str | None, clear: bool):
+    """Set TEXT as the copyright of every image, or remove it all with --none.
 
-    Removes every tag with "copyright" in its name (EXIF, IPTC, XMP, PNG) plus the XMP rights
-    tags (dc:Rights, xmpRights and PLUS licensing).
+    --none removes every tag with "copyright" in its name (EXIF, IPTC, XMP, PNG) plus the XMP
+    rights tags (dc:Rights, xmpRights and PLUS licensing).
+
+    \b
+    Examples:
+      imfix copyright . --none
+      imfix copyright . "© 2025 Jane Smith"
     """
-    args = ["-*copyright*=", "-XMP-dc:Rights=", "-XMP-xmpRights:all=", "-XMP-plus:all="]
+    if clear == (text is not None):
+        raise click.UsageError('Give either the copyright TEXT or --none (e.g. imfix copyright . --none).')
+
+    if clear:
+        args = ["-*copyright*=", "-XMP-dc:Rights=", "-XMP-xmpRights:all=", "-XMP-plus:all="]
+        did, would = "cleaned", "remove the copyright from"
+    else:
+        args = iptc_charset([text]) + [f"-Copyright={text}", f"-XMP-dc:Rights={text}", f"-IPTC:CopyrightNotice={text}"]
+        did, would = "updated", f'set the copyright to "{text}" on'
+
     files = run.files(METADATA_EXTS)
     if files:
-        apply_metadata(run, [(f, args) for f in files], did="cleaned", would="strip copyright from")
+        apply_metadata(run, [(f, args) for f in files], did=did, would=would)
 
 
-@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Set or remove the author.")
+@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Set or remove the author.",
+             epilog=WORKING_COPY_EPILOG)
 @common_options()
 @click.argument("name", required=False)
 @click.option("--none", "clear", is_flag=True, help="Remove the author instead of setting one.")
 def author(run: Run, name: str | None, clear: bool):
-    """Set NAME as the author of every image in DIR, or remove it with --none.
+    """Set NAME as the author of every image, or remove it with --none.
 
     Writes EXIF Artist, XMP Creator, IPTC By-line and the Windows "Authors" field.
 
@@ -344,20 +438,40 @@ def author(run: Run, name: str | None, clear: bool):
         apply_metadata(run, [(f, args) for f in files], did=did, would=would)
 
 
-@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Rename to yyyy-mm-dd_hh-mm-ss.")
+def _check_prefix(ctx, param, value: str | None) -> str | None:
+    if value is None:
+        return None
+    if BAD_NAME_CHARS & set(value) or value != value.strip():
+        raise click.BadParameter('can\'t contain < > : " / \\ | ? * or start/end with spaces.')
+    return value
+
+
+@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Rename to yyyy-mm-dd_hh-mm-ss.",
+             epilog=WORKING_COPY_EPILOG)
 @common_options()
-def rename(run: Run):
-    """Rename every image in DIR to yyyy-mm-dd_hh-mm-ss.
+@click.option("-p", "--prefix", callback=_check_prefix,
+              help='Text to put before every name, e.g. "trip" gives trip_2025-01-01_09-30-00.jpg.')
+def rename(run: Run, prefix: str | None):
+    """Rename every image and video to yyyy-mm-dd_hh-mm-ss.
 
     The date taken is used where there is one. Otherwise the file's created date is used
     (or its modified date on systems that don't record one, which includes most of Linux).
-    Images with the same time get _1, _2... added, in order of their original names.
+    Files with the same time get _1, _2... added, in order of their original names.
 
     Tip: run "imfix date" first so images with a date in their name keep it.
+
+    \b
+    Examples:
+      imfix rename .                    2025-01-01_09-30-00.jpg
+      imfix rename . --prefix trip      trip_2025-01-01_09-30-00.jpg
     """
-    files = run.files(METADATA_EXTS | COMPRESS_EXTS)
+    files = run.files(METADATA_EXTS | IMAGE_EXTS | VIDEO_EXTS)
     if not files:
         return
+
+    start = ""
+    if prefix:
+        start = prefix if prefix[-1] in "_- " else prefix + "_"
 
     tags = ExifTool(run.verbose).read(files, DATE_TAGS)
     dated: list[tuple[datetime, str, Path]] = []
@@ -370,146 +484,193 @@ def rename(run: Run):
         dated.append((when, source, f))
     dated.sort(key=lambda item: (item[0], item[2].name.casefold()))
 
-    # Names already used in each destination folder. Files being renamed don't block their own names.
+    # Names already used in each folder. Files being renamed don't block their own names.
     batch = {os.path.normcase(f) for f in files}
     taken: dict[Path, set[str]] = {}
-    for _, _, f in dated:
-        folder = run.destination_dir(f)
-        if folder not in taken:
-            taken[folder] = {
-                p.stem.casefold() for p in (folder.iterdir() if folder.is_dir() else [])
-                if os.path.normcase(p) not in batch
-            }
-
-    plan = []
-    for when, source, f in dated:
-        folder = run.destination_dir(f)
-        new = folder / (unique_stem(when.strftime(RENAME_FORMAT), taken[folder]) + f.suffix)
-        plan.append((f, new, source))
+    for f in files:
+        if f.parent not in taken:
+            taken[f.parent] = {p.stem.casefold() for p in f.parent.iterdir() if os.path.normcase(p) not in batch}
 
     counts = {"renamed": 0, "already named": 0}
     moves = []
-    for src, dst, source in plan:
-        if run.in_place and src.name == dst.name:
+    for when, source, f in dated:
+        new = f.with_name(unique_stem(start + when.strftime(RENAME_FORMAT), taken[f.parent]) + f.suffix)
+        if new.name == f.name:
             counts["already named"] += 1
-            run.detail(f"{run.show(src)} is already named correctly")
+            run.detail(f"{run.show(f)} is already named correctly")
             continue
-        if run.dry_run or run.verbose:
-            run.info(f"{'Would rename' if run.dry_run else 'Renaming'} {run.show(src)} -> {dst.name}  ({source})")
         counts["renamed"] += 1
-        if not run.dry_run:
-            moves.append((src, dst))
+        if run.dry_run or run.verbose:
+            run.info(f"{'Would rename' if run.dry_run else 'Renaming'} {run.show(f)} -> {new.name}  ({source})")
+        moves.append((f, new))
 
-    if run.in_place:
+    if not run.dry_run:
         # Two steps, so one file can take a name another file in the batch is giving up.
         temporary = []
         for src, dst in moves:
-            temp = src.with_name(f".imfix-{uuid.uuid4().hex}{src.suffix}")
+            temp = src.with_name(f"{TEMP_PREFIX}{uuid.uuid4().hex}{src.suffix}")
             src.rename(temp)
-            temporary.append((temp, dst))
-        for temp, dst in temporary:
+            temporary.append((src, temp, dst))
+        for src, temp, dst in temporary:
             temp.rename(dst)
+            if run.working:
+                run.working.moved(src, dst)
+        if run.working and moves:
+            run.working.save()
     else:
-        for src, dst in moves:
-            copy_file(src, dst)
-
-    if run.dry_run:
         counts = {"would be renamed": counts["renamed"], "already named": counts["already named"]}
     run.summary(counts)
 
 
-@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Compress images to JPEG or WebP.")
+@cli.command(context_settings=CONTEXT, no_args_is_help=True, short_help="Compress images, audio and video.",
+             epilog=COMPRESS_EPILOG)
 @common_options(in_place=False)
-@click.option("-f", "--format", "fmt", type=click.Choice(["jpg", "webp"]), default="jpg", show_default=True,
-              help="Output format. Use webp to keep PNG transparency.")
-@click.option("-q", "--quality", type=int,
+@click.option("-t", "--type", "types", multiple=True, type=click.Choice(["image", "audio", "video"]),
+              help="Only compress this type of file. Can be given more than once. Default: all three.")
+@click.option("--image-format", type=click.Choice(["jpg", "webp"]), default="jpg", show_default=True,
+              help="Image output format. Use webp to keep PNG transparency.")
+@click.option("--image-quality", type=int,
               help="JPEG: 2 (best) to 31 (worst), default 5.  WebP: 0 to 100 (best), default 75.")
-@click.option("--strip-metadata", is_flag=True, help="Don't copy metadata to the compressed images.")
-def compress(run: Run, fmt: str, quality: int | None, strip_metadata: bool):
-    """Compress every image in DIR with ffmpeg.
+@click.option("--audio-format", type=click.Choice(["opus", "mp3", "m4a"]), default="opus", show_default=True,
+              help="Audio output format. Opus is smallest for the quality; mp3 plays everywhere.")
+@click.option("--audio-bitrate",
+              help="Audio bitrate, e.g. 64k. Defaults: opus 96k, mp3 160k, m4a 128k. "
+                   "Opus guide: 32k speech, 64k podcasts, 96k-128k music.")
+@click.option("--video-codec", type=click.Choice(list(VIDEO_CODECS)), default="h264", show_default=True,
+              help="h265 gives smaller files but encodes slower and plays on fewer old devices.")
+@click.option("--crf", type=click.IntRange(0, 51), default=28, show_default=True,
+              help="Video quality. Lower = better and bigger. 18 is near-lossless, 30+ is small.")
+@click.option("--preset", type=click.Choice(PRESETS), default="medium", show_default=True,
+              help="Video encoding speed. Slower gives slightly smaller files.")
+@click.option("--strip-metadata", is_flag=True, help="Don't keep any metadata in the compressed files.")
+@click.option("--recompress", is_flag=True, help="Compress files again even if imfix already compressed them.")
+def compress(run: Run, types: tuple[str, ...], image_format: str, image_quality: int | None, audio_format: str,
+             audio_bitrate: str | None, video_codec: str, crf: int, preset: str, strip_metadata: bool,
+             recompress: bool):
+    """Compress every image, audio and video file with ffmpeg.
 
-    Images are re-encoded as JPEG (default) or WebP into the output folder. Metadata (date
-    taken, camera, GPS, tags...) and file dates are copied over unless --strip-metadata is
-    given. This command never changes the originals, so it has no --in-place option.
+    \b
+      Images  -> JPEG (default) or WebP
+      Audio   -> Opus (default), MP3 or M4A
+      Video   -> MP4 with H.264 (default) or H.265
 
-    Supported inputs: jpg jpeg png bmp tif tiff webp. Needs ffmpeg on the PATH.
+    Each file in the working copy is replaced by its compressed version (the originals in DIR
+    are untouched). Metadata (date taken,
+    camera, GPS, tags, audio tags and cover art) and file dates are kept unless --strip-metadata
+    is given. If a compressed file comes out bigger, the original is kept instead. Files imfix
+    has already compressed are skipped, so running this twice doesn't lose quality. This command never changes the originals, so it has no --in-place option.
+
+    Needs ffmpeg on the PATH.
+
+    \b
+    Examples:
+      imfix compress .                          everything, with the defaults
+      imfix compress . -t audio --audio-bitrate 64k
+      imfix compress . -t video --video-codec h265 --crf 30
     """
-    if quality is None:
-        quality = 5 if fmt == "jpg" else 75
-    valid = range(2, 32) if fmt == "jpg" else range(0, 101)
-    if quality not in valid:
-        raise click.BadParameter(f"must be between {valid.start} and {valid.stop - 1} for {fmt}", param_hint="--quality")
+    if image_quality is None:
+        image_quality = 5 if image_format == "jpg" else 75
+    valid = range(2, 32) if image_format == "jpg" else range(0, 101)
+    if image_quality not in valid:
+        raise click.BadParameter(f"must be between {valid.start} and {valid.stop - 1} for {image_format}",
+                                 param_hint="--image-quality")
 
-    files = run.files(COMPRESS_EXTS)
+    settings = Settings(image_format, image_quality, audio_format, audio_bitrate or DEFAULT_AUDIO_BITRATE[audio_format],
+                        video_codec, crf, preset, strip_metadata)
+    exts = {"image": IMAGE_EXTS, "audio": AUDIO_EXTS, "video": VIDEO_EXTS}
+    wanted = set().union(*(exts[t] for t in (types or exts)))
+
+    files = run.files(wanted)
     if not files:
         return
     ffmpeg = find("ffmpeg", "Install it from https://ffmpeg.org (Windows: winget install ffmpeg).")
-    exiftool = None if strip_metadata or run.dry_run else ExifTool(run.verbose)
+    working = run.working
 
-    if fmt == "jpg":
-        codec_args = ["-q:v", str(quality)]
-    else:
-        codec_args = ["-c:v", "libwebp", "-quality", str(quality)]
-
-    # Two inputs can map to the same output (photo.png and photo.jpg -> photo.jpg).
-    taken: dict[Path, set[str]] = defaultdict(set)
-    counts = {"compressed": 0, "skipped": 0, "failed": 0}
+    counts = {"compressed": 0, "kept original": 0, "already compressed": 0, "failed": 0}
     if run.dry_run:
-        counts = {"would be compressed": 0, "skipped": 0}
-    done = []
+        counts = {"would be compressed": 0, "already compressed": 0}
+
+    # Names in use per folder, so photo.png and photo.jpg don't both become photo.jpg.
+    taken: dict[Path, set[str]] = {}
+    jobs = []  # (original, compressed temp file, final path, kind, times)
     total_before = total_after = 0
 
     for i, src in enumerate(files, 1):
-        folder = run.destination_dir(src)
-        dst = folder / f"{unique_stem(src.stem, taken[folder])}.{fmt}"
-        prefix = f"[{i}/{len(files)}]"
-
-        if dst.exists():
-            run.warn(f"{prefix} Skipping {run.show(src)}: {run.show(dst)} already exists.")
-            counts["skipped"] += 1
+        kind = kind_of(src)
+        if working and not recompress and working.root in src.parents and working.is_compressed(src):
+            counts["already compressed"] += 1
+            run.detail(f"Skipping {run.show(src)}: already compressed (use --recompress to do it again)")
             continue
 
-        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                   # Keep pixels as stored, so the copied EXIF orientation still displays correctly.
-                   "-noautorotate", "-i", str(src),
-                   "-map_metadata", "-1", "-frames:v", "1", *codec_args, str(dst)]
+        folder = src.parent
+        if folder not in taken:
+            # Every name that exists now stays reserved, so a file that is skipped, fails or is kept
+            # can never be overwritten by another file's compressed version.
+            taken[folder] = {p.name.casefold() for p in folder.iterdir()}
+        ext = "." + settings.extension(kind)
+        if (src.stem + ext).casefold() == src.name.casefold():
+            final = src
+        else:
+            final = folder / (unique_stem(src.stem, taken[folder], ext) + ext)
+        temp = folder / f"{TEMP_PREFIX}{uuid.uuid4().hex}{ext}"
+        command = [ffmpeg, *settings.ffmpeg_args(kind, src, temp)]
 
         if run.dry_run:
             counts["would be compressed"] += 1
-            run.info(f"Would compress {run.show(src)} -> {run.show(dst)}")
+            run.info(f"Would compress {run.show(src)} -> {final.name}")
             run.detail("    " + subprocess.list2cmdline(command))
             continue
 
-        run.info(f"{prefix} Compressing {run.show(src)}...")
+        run.info(f"[{i}/{len(files)}] Compressing {run.show(src)}...")
         run.detail("    " + subprocess.list2cmdline(command))
-        folder.mkdir(parents=True, exist_ok=True)
         times = FileTimes.of(src)
-        result = subprocess.run(command, capture_output=True)
-        if result.returncode != 0 or not dst.exists():
+        # Videos show ffmpeg's progress line; other files are quick, so their output is captured.
+        result = subprocess.run(command, stdout=subprocess.DEVNULL if kind == "video" else subprocess.PIPE,
+                                stderr=None if kind == "video" else subprocess.PIPE)
+        if result.returncode != 0 or not temp.exists():
             counts["failed"] += 1
-            run.error(f"    Failed: {result.stderr.decode('utf-8', 'replace').strip()}")
-            dst.unlink(missing_ok=True)
+            detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+            run.error(f"    Failed{': ' + detail if detail else ''}")
+            temp.unlink(missing_ok=True)
             continue
 
-        before, after = src.stat().st_size, dst.stat().st_size
+        before, after = src.stat().st_size, temp.stat().st_size
+        if after >= before:
+            run.info(f"    {_size_change(before, after)} - kept the original")
+            temp.unlink()
+            counts["kept original"] += 1
+            if working:
+                working.mark_compressed(src)
+            continue
+
         total_before += before
         total_after += after
         run.info(f"    {_size_change(before, after)}")
-        counts["compressed"] += 1
-        done.append((src, dst, times))
+        jobs.append((src, temp, final, kind, times))
 
-    if exiftool and done:
-        run.info(f"Copying metadata for {len(done)} file(s)...")
-        problems = exiftool.write([
-            (dst, ["-TagsFromFile", str(src), "-all:all", "-ICC_Profile"]) for src, dst, _ in done
-        ])
-        for src, dst, _ in done:
-            errors = [m for m in problems.get(dst, []) if m.startswith("Error")]
-            if errors:
-                run.warn(f"Metadata not copied to {run.show(dst)}: {errors[0]}")
+    if not run.dry_run:
+        meta_jobs = [(temp, ["-TagsFromFile", str(src), "-all:all", "-ICC_Profile"])
+                     for src, temp, _, kind, _ in jobs if settings.copies_metadata_with_exiftool(kind)]
+        if meta_jobs:
+            run.info(f"Copying metadata for {len(meta_jobs)} file(s)...")
+            problems = ExifTool(run.verbose).write(meta_jobs)
+            for src, temp, final, _, _ in jobs:
+                errors = [m for m in problems.get(temp, []) if m.startswith("Error")]
+                if errors:
+                    run.warn(f"Metadata not copied to {final.name}: {errors[0]}")
 
-    for _, dst, times in done:
-        times.apply(dst)
+        # Swap each original for its compressed version.
+        for src, temp, final, _, times in jobs:
+            times.apply(temp)
+            src.unlink()
+            os.replace(temp, final)
+            counts["compressed"] += 1
+            if working:
+                working.forget(src)
+                working.mark_compressed(final)
+
+        if working:
+            working.save()
 
     if total_before:
         run.info(f"Total: {_size_change(total_before, total_after)}")

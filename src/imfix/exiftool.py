@@ -62,7 +62,8 @@ class ExifTool:
         """Read `tags` from every file. Returns {normalised path: {tag: value}}."""
         if not paths:
             return {}
-        lines = ["-json", *(f"-{tag}" for tag in tags), *map(str, paths)]
+        # QuickTimeUTC: video dates are stored in UTC, so convert them to local time like photo dates.
+        lines = ["-json", "-api", "QuickTimeUTC", *(f"-{tag}" for tag in tags), *map(str, paths)]
         proc = self._run(["-charset", "filename=utf8", "-@", "-"], lines)
         stdout = proc.stdout.decode("utf-8", "replace").strip()
         try:
