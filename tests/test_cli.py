@@ -45,6 +45,13 @@ def make_video(path: Path) -> Path:
     return path
 
 
+def pixels(path: Path) -> str:
+    """A checksum of the decoded image, which only changes if the picture itself was re-encoded."""
+    out = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(path), "-f", "md5", "-"],
+                         capture_output=True, check=True)
+    return out.stdout.decode().strip()
+
+
 def read(path: Path, *tags: str) -> dict:
     args = ["exiftool", "-json", "-charset", "filename=utf8", *(f"-{t}" for t in tags), str(path)]
     return json.loads(subprocess.run(args, capture_output=True, check=True).stdout)[0]
@@ -56,7 +63,7 @@ def write(path: Path, *args: str) -> None:
 
 
 def names(folder: Path) -> list[str]:
-    return sorted(p.name for p in folder.iterdir() if p.is_file() and p.name != ".imfix.json")
+    return sorted(p.name for p in folder.iterdir() if p.is_file())
 
 
 def imfix(*args: str):
@@ -98,7 +105,7 @@ def test_first_command_copies_all_media_and_leaves_originals(photos):
 
     out = photos / "imfix"
     assert names(out) == sorted(["Zoë's café.jpg", "IMG_20230514_142301.jpg", "ABC_20250101_0935790135.png", "song.wav"])
-    assert (out / ".imfix.json").exists()
+    assert not list(out.rglob("*.json"))  # nothing but the copies goes in the working copy
     assert not (out / "sub").exists()  # no --recurse
 
     tags = read(out / "Zoë's café.jpg", "Subject", "Keywords")
@@ -152,9 +159,58 @@ def test_in_place_changes_originals_without_working_copy(photos):
 def test_recurse_keeps_layout_and_skips_working_copy(photos):
     imfix("tag", photos, "x", "-r")
     assert (photos / "imfix" / "sub" / "PXL_20240202_101010123.jpg").exists()
-    imfix("tag", photos, "y", "-r")
+    imfix("tag", photos, "y")  # no -r needed once the working copy exists
     assert not (photos / "imfix" / "imfix").exists()
     assert read(photos / "imfix" / "sub" / "PXL_20240202_101010123.jpg", "Subject")["Subject"] == ["x", "y"]
+
+
+def test_running_inside_the_working_copy_changes_it(photos):
+    imfix("tag", photos, "x")
+    result = imfix("tag", photos / "imfix", "y")
+    assert "is an imfix working copy" in result.output
+    assert not (photos / "imfix" / "imfix").exists()
+    assert read(photos / "imfix" / "Zoë's café.jpg", "Subject")["Subject"] == ["x", "y"]
+    assert "Subject" not in read(photos / "Zoë's café.jpg", "Subject")
+
+    # --fresh from inside still copies the originals from the folder above.
+    imfix("tag", photos / "imfix", "z", "--fresh")
+    assert read(photos / "imfix" / "Zoë's café.jpg", "Subject")["Subject"] == "z"
+
+
+def test_later_commands_include_all_of_the_working_copy(tmp_path):
+    """The reported layout: files only in nested subfolders, and later commands without -r."""
+    pics = tmp_path / "Pictures"
+    make_image(pics / "Holiday" / "Day 1" / "a.jpg")
+    make_image(pics / "Holiday" / "Day 2" / "b.jpg")
+    imfix("tag", pics, "x", "-r")
+
+    for target in (pics, pics / "imfix"):  # from DIR, and from inside the working copy
+        result = imfix("copyright", target, "--none", "-v")
+        assert "2 cleaned" in result.output
+    assert "Subject" in read(pics / "imfix" / "Holiday" / "Day 2" / "b.jpg", "Subject")
+    assert not (pics / "imfix" / "imfix").exists()
+
+
+def test_warns_about_new_originals_in_subfolders_without_r(tmp_path):
+    make_image(tmp_path / "sub" / "a.jpg")
+    imfix("tag", tmp_path, "x", "-r")
+    make_image(tmp_path / "sub" / "new.jpg")
+    assert "1 more file(s)" in imfix("tag", tmp_path, "y").output
+
+
+def test_recurse_without_working_copy_still_needed_for_in_place(tmp_path):
+    make_image(tmp_path / "sub" / "a.jpg")
+    result = imfix("tag", tmp_path, "x", "--in-place")
+    assert "add -r" in result.output
+    assert "1 tagged" in imfix("tag", tmp_path, "x", "--in-place", "-r").output
+
+
+def test_folder_without_media_does_not_crash(tmp_path):
+    (tmp_path / "notes.txt").write_text("hi")
+    result = imfix("copyright", tmp_path, "--none", "-v")
+    assert result.exit_code == 0
+    assert "No matching files" in result.output
+    assert not (tmp_path / "imfix").exists()
 
 
 def test_fresh_starts_again_from_originals(photos):
@@ -172,15 +228,47 @@ def test_warns_about_new_originals(photos):
     assert not (photos / "imfix" / "new.jpg").exists()
 
 
-def test_refuses_to_use_a_foreign_output_folder(photos, tmp_path):
-    foreign = tmp_path / "mine"
-    make_image(foreign / "precious.jpg")
-    for extra in ([], ["--fresh"]):
-        result = CliRunner().invoke(cli, ["tag", str(photos), "x", "-o", str(foreign), *extra])
-        assert result.exit_code != 0
-        assert "didn't put there" in result.output
-    assert names(foreign) == ["precious.jpg"]
-    assert "Subject" not in read(foreign / "precious.jpg", "Subject")
+def test_fresh_asks_before_deleting_a_custom_output_folder(photos, tmp_path):
+    custom = tmp_path / "mine"
+    imfix("tag", photos, "x", "-o", custom)
+
+    declined = CliRunner().invoke(cli, ["tag", str(photos), "y", "-o", str(custom), "--fresh"], input="n\n")
+    assert declined.exit_code != 0
+    assert read(custom / "Zoë's café.jpg", "Subject")["Subject"] == "x"  # untouched
+
+    accepted = CliRunner().invoke(cli, ["tag", str(photos), "y", "-o", str(custom), "--fresh"], input="y\n")
+    assert accepted.exit_code == 0
+    assert read(custom / "Zoë's café.jpg", "Subject")["Subject"] == "y"
+
+
+def test_fresh_on_default_folder_does_not_ask(photos):
+    imfix("tag", photos, "x")
+    result = imfix("tag", photos, "y", "--fresh")  # no input given: a prompt would abort
+    assert result.exit_code == 0
+    assert read(photos / "imfix" / "Zoë's café.jpg", "Subject")["Subject"] == "y"
+
+
+@pytest.mark.parametrize("recurse", [[], ["-r"]])
+def test_dot_folders_are_ignored(photos, recurse):
+    make_image(photos / ".thumbnails" / "thumb.jpg")
+    make_image(photos / "sub" / ".cache" / "c.jpg")
+    imfix("tag", photos, "x", *recurse)
+    copied = {p.relative_to(photos / "imfix").as_posix() for p in (photos / "imfix").rglob("*") if p.is_file()}
+    assert not any(part.startswith(".") for c in copied for part in c.split("/"))
+    assert ("sub/PXL_20240202_101010123.jpg" in copied) == bool(recurse)
+    assert "Subject" not in read(photos / ".thumbnails" / "thumb.jpg", "Subject")
+
+
+def test_dot_named_dir_itself_still_works(tmp_path):
+    folder = tmp_path / ".hidden"
+    make_image(folder / "a.jpg")
+    old = os.getcwd()
+    os.chdir(folder)
+    try:
+        result = imfix("tag", ".", "x")
+    finally:
+        os.chdir(old)
+    assert "1 tagged" in result.output
 
 
 def test_dry_run_changes_nothing(photos):
@@ -239,6 +327,38 @@ def test_bad_file_is_reported(tmp_path):
     assert "1 tagged" in result.output and "1 failed" in result.output
 
 
+def test_wrong_extension_is_fixed_in_the_working_copy(tmp_path):
+    webp = make_image(tmp_path / "real.webp")
+    shutil.copy(webp, tmp_path / "fake.jpg")
+    webp.unlink()
+    shutil.copy(make_image(tmp_path / "p.png"), tmp_path / "png-as.jpg")
+    make_image(tmp_path / "fake.webp")  # name clash for fake.jpg -> fake.webp
+
+    result = imfix("tag", tmp_path, "x")
+    assert result.exit_code == 0
+    assert "Renamed fake.jpg -> fake_1.webp (it's really a WEBP image)" in result.output
+    assert "failed" not in result.output
+    out = tmp_path / "imfix"
+    assert names(out) == ["fake.webp", "fake_1.webp", "p.png", "png-as.png"]
+    assert read(out / "fake_1.webp", "Subject")["Subject"] == "x"
+    assert (tmp_path / "fake.jpg").exists()  # the original keeps its name
+
+
+def test_wrong_extension_in_place_is_explained_not_renamed(tmp_path):
+    shutil.copy(make_image(tmp_path / "a.webp"), tmp_path / "b.jpg")
+    result = imfix("tag", tmp_path, "x", "--in-place")
+    assert "Failed: b.jpg" in result.output
+    assert "extension doesn't match" in result.output
+    assert (tmp_path / "b.jpg").exists()
+
+
+def test_wrong_extension_dry_run_renames_nothing(tmp_path):
+    shutil.copy(make_image(tmp_path / "a.webp"), tmp_path / "b.jpg")
+    result = imfix("tag", tmp_path, "x", "--dry-run")
+    assert "Would rename b.jpg -> b_1.webp" in result.output or "Would rename b.jpg -> b.webp" in result.output
+    assert not (tmp_path / "imfix").exists()
+
+
 # --- rename ---------------------------------------------------------------------------------
 
 def test_rename_uses_date_taken_then_file_date_with_counters(photos):
@@ -270,6 +390,14 @@ def test_rename_prefix(tmp_path, prefix, expected):
 
 def test_rename_rejects_bad_prefix(tmp_path):
     assert CliRunner().invoke(cli, ["rename", str(tmp_path), "--prefix", "a/b"]).exit_code == 2
+
+
+def test_rename_ignores_placeholder_video_date(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc=size=64x64:rate=25:duration=1", "-c:v", "mpeg4", str(clip))
+    os.utime(clip, (1_600_000_000, 1_600_000_000))
+    imfix("rename", tmp_path, "--in-place")
+    assert not any(n.startswith("1904") or n.startswith("1903") for n in names(tmp_path))
 
 
 def test_rename_includes_videos_in_local_time(tmp_path):
@@ -340,8 +468,36 @@ def test_compress_name_clashes_never_overwrite(tmp_path):
 
 def test_compress_keeps_original_when_bigger(tmp_path):
     make_image(tmp_path / "small.jpg", "320x240", "-q:v", "31")
-    before = (tmp_path / "small.jpg").read_bytes()
+    os.utime(tmp_path / "small.jpg", (1_600_000_000, 1_600_000_000))
+    original_pixels = pixels(tmp_path / "small.jpg")
     result = imfix("compress", tmp_path, "--image-quality", "2")
     assert "kept the original" in result.output
-    assert (tmp_path / "imfix" / "small.jpg").read_bytes() == before
+
+    kept = tmp_path / "imfix" / "small.jpg"
+    assert pixels(kept) == original_pixels  # not re-encoded, only the marker added
+    assert kept.stat().st_mtime == 1_600_000_000
     assert not any(p.name.startswith(".imfix-") for p in (tmp_path / "imfix").iterdir())
+
+    # Marked as checked, so the next run doesn't try again.
+    assert "1 already compressed" in imfix("compress", tmp_path, "--image-quality", "2").output
+
+
+@pytest.mark.parametrize("audio_format", ["opus", "mp3", "m4a"])
+def test_compressed_audio_is_not_compressed_again(tmp_path, audio_format):
+    make_audio(tmp_path / "a.wav")
+    imfix("compress", tmp_path, "--audio-format", audio_format)
+    result = imfix("compress", tmp_path, "--audio-format", audio_format)
+    assert "1 already compressed" in result.output
+    assert not list((tmp_path / "imfix").rglob("*.json"))
+
+
+def test_compressed_video_is_not_compressed_again(tmp_path):
+    make_video(tmp_path / "clip.mov")
+    imfix("compress", tmp_path, "--preset", "ultrafast")
+    assert "1 already compressed" in imfix("compress", tmp_path).output
+
+
+def test_strip_metadata_still_marks_compressed(tmp_path):
+    make_image(tmp_path / "a.png")
+    imfix("compress", tmp_path, "--strip-metadata")
+    assert "1 already compressed" in imfix("compress", tmp_path).output

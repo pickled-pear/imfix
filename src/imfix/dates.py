@@ -28,6 +28,12 @@ _COMPACT_TIME_LENGTHS = range(6, 10)
 _EXIF_DATE = re.compile(r"^(\d{4})[:-](\d{2})[:-](\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?")
 
 
+# Programs write the zero point of their clock when they have no real date: 1904-01-01 for
+# QuickTime/MP4 video and 1970-01-01 for Unix. After converting from UTC to local time these can
+# land a few hours either side, so anything within a day of them counts as "no date".
+_PLACEHOLDER_DATES = [datetime(1904, 1, 1), datetime(1970, 1, 1)]
+
+
 def _make(year, month, day, hour=0, minute=0, second=0) -> datetime | None:
     try:
         return datetime(int(year), int(month), int(day), int(hour), int(minute), int(second))
@@ -86,7 +92,10 @@ def parse_exif_date(value) -> datetime | None:
     m = _EXIF_DATE.match(value.strip())
     if not m:
         return None
-    return _make(m[1], m[2], m[3], m[4] or 0, m[5] or 0, m[6] or 0)
+    date = _make(m[1], m[2], m[3], m[4] or 0, m[5] or 0, m[6] or 0)
+    if date is None or any(abs((date - zero).total_seconds()) <= 86400 for zero in _PLACEHOLDER_DATES):
+        return None
+    return date
 
 
 def to_exif(date: datetime) -> str:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sys
@@ -29,17 +28,17 @@ TEMP_PREFIX = ".imfix-"
 
 
 def collect(directory: Path, recurse: bool, exts: set[str], exclude: Path | None) -> list[Path]:
-    """List the matching files in `directory`, skipping the `exclude` folder."""
+    """List the matching files in `directory`.
+
+    Folders whose names start with "." (such as .thumbnails or .git) are always skipped, as is
+    the `exclude` folder. `directory` itself is used whatever its name, so "." works.
+    """
     found = []
     walker = os.walk(directory) if recurse else [(str(directory), [], os.listdir(directory))]
     for root, dirs, names in walker:
         root_path = Path(root)
-        if exclude is not None:
-            dirs[:] = [
-                d for d in dirs
-                if not d.startswith(".")
-                and (exclude is None or not _same(root_path / d, exclude))
-            ]
+        dirs[:] = [d for d in dirs if not d.startswith(".")
+                   and not (exclude is not None and _same(root_path / d, exclude))]
         for name in names:
             path = root_path / name
             if path.suffix.lower() in exts and not name.startswith(TEMP_PREFIX) and path.is_file():
@@ -140,54 +139,3 @@ def unique_stem(stem: str, taken: set[str], suffix: str = "") -> str:
         candidate = f"{stem}_{counter}"
     taken.add((candidate + suffix).casefold())
     return candidate
-
-
-class WorkingCopy:
-    """The output folder: a copy of the originals that each command edits in turn.
-
-    A small state file marks the folder as imfix's own, and remembers which files have
-    already been compressed so running `compress` again doesn't lose quality each time.
-    """
-
-    STATE_FILE = ".imfix.json"
-
-    def __init__(self, root: Path):
-        self.root = root
-        self.state_path = root / self.STATE_FILE
-        self.compressed: set[str] = set()
-        try:
-            self.compressed = set(json.loads(self.state_path.read_text("utf-8")).get("compressed", []))
-        except (OSError, ValueError, AttributeError):
-            pass
-
-    @property
-    def marked(self) -> bool:
-        return self.state_path.is_file()
-
-    def has_files(self) -> bool:
-        return self.root.is_dir() and any(p.is_file() and p != self.state_path for p in self.root.rglob("*"))
-
-    def _rel(self, path: Path) -> str:
-        return path.relative_to(self.root).as_posix()
-
-    def is_compressed(self, path: Path) -> bool:
-        return self._rel(path) in self.compressed
-
-    def mark_compressed(self, path: Path) -> None:
-        self.compressed.add(self._rel(path))
-
-    def forget(self, path: Path) -> None:
-        self.compressed.discard(self._rel(path))
-
-    def moved(self, old: Path, new: Path) -> None:
-        if self.is_compressed(old):
-            self.forget(old)
-            self.mark_compressed(new)
-
-    def save(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        state = {
-            "about": "imfix working copy. Delete this folder (or use --fresh) to start again from the originals.",
-            "compressed": sorted(self.compressed),
-        }
-        self.state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), "utf-8")

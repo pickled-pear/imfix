@@ -14,7 +14,9 @@ from pathlib import Path
 import click
 
 from imfix import __version__
-from imfix.compress import DEFAULT_AUDIO_BITRATE, PRESETS, VIDEO_CODECS, Settings, kind_of
+from imfix.compress import (
+    DEFAULT_AUDIO_BITRATE, MARKER_TAGS, PRESETS, VIDEO_CODECS, Settings, history_entry, is_marked, kind_of,
+)
 from imfix.dates import date_from_filename, parse_exif_date, to_exif
 from imfix.exiftool import ExifTool, find
 from imfix.files import (
@@ -25,7 +27,6 @@ from imfix.files import (
     TEMP_PREFIX,
     VIDEO_EXTS,
     FileTimes,
-    WorkingCopy,
     best_file_date,
     collect,
     copy_file,
@@ -39,6 +40,13 @@ DATE_TAGS = ["DateTimeOriginal", "CreateDate", "DateCreated"]
 
 RENAME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
+# Image types whose extension imfix corrects in the working copy when it doesn't match the
+# contents (e.g. a WebP image saved as photo.jpg), keyed by exiftool's FileTypeExtension.
+IMAGE_TYPE_EXTS = {
+    "jpg": {".jpg", ".jpeg", ".jpe"}, "png": {".png"}, "webp": {".webp"}, "gif": {".gif"},
+    "tif": {".tif", ".tiff"}, "heic": {".heic", ".heif"}, "avif": {".avif"}, "bmp": {".bmp"},
+}
+
 # Characters Windows doesn't allow in filenames.
 BAD_NAME_CHARS = set('<>:"/\\|?*')
 
@@ -50,8 +58,11 @@ changes the copies. Every later command on the same DIR changes those same
 copies, so commands build on each other, e.g. "imfix rename ." then
 "imfix compress .". The originals are never changed. --fresh deletes the
 working copy and copies the originals again, which is also how to pick up
-files added to DIR later. Only the first command's --recurse decides whether
-subfolders are copied."""
+files added to DIR later. Running a command inside DIR/imfix does the same as
+running it on DIR. --recurse only matters when the working copy is made: it
+decides whether subfolders are copied. After that, every command changes all
+the copies, subfolders included. Folders starting with "." are always
+ignored."""
 
 # Shown at the end of each command's --help.
 WORKING_COPY_EPILOG = _WORKING_COPY_STEPS + """
@@ -80,7 +91,17 @@ class Run:
         self.input = directory.resolve()
         self.in_place = in_place
         self.custom_output = output is not None
-        self.working = None if in_place else WorkingCopy(output.resolve() if output else self.input / DEFAULT_OUTPUT)
+        # The working copy folder, or None with --in-place.
+        self.working: Path | None = None if in_place else (output.resolve() if output else self.input / DEFAULT_OUTPUT)
+
+        # Running inside a working copy (e.g. "cd imfix" then "imfix compress .") means the same as
+        # running on the folder above it, rather than making a working copy of the working copy.
+        self.inside_working_copy = (
+            not in_place and output is None and self.input.name.casefold() == DEFAULT_OUTPUT.casefold()
+        )
+        if self.inside_working_copy:
+            self.working = self.input
+            self.input = self.input.parent
         self.fresh = fresh
         self.recurse = recurse
         self.verbose = verbose
@@ -95,54 +116,91 @@ class Run:
         """
         if self._root is None:
             self._root = self._prepare()
+            if self.working is not None:
+                self._fix_extensions(self._root)
         return self._root
 
+    def _fix_extensions(self, root: Path) -> None:
+        """Give images in the working copy the extension that matches what they really are.
+
+        A WebP or PNG saved with a .jpg name opens fine in Windows, but exiftool refuses to
+        write to it. Only copies are renamed: with --in-place the originals are left alone.
+        """
+        images = collect(root, True, set().union(*IMAGE_TYPE_EXTS.values()), exclude=self.working if root == self.input else None)
+        types = ExifTool(self.verbose).read(images, ["FileType", "FileTypeExtension"], fast=True)
+        taken: dict[Path, set[str]] = {}
+        for path in images:
+            tags = ExifTool.lookup(types, path)
+            real = str(tags.get("FileTypeExtension", "")).lower()
+            if real not in IMAGE_TYPE_EXTS or path.suffix.lower() in IMAGE_TYPE_EXTS[real]:
+                continue
+            if path.parent not in taken:
+                taken[path.parent] = {p.name.casefold() for p in path.parent.iterdir()}
+            ext = "." + real
+            new = path.with_name(unique_stem(path.stem, taken[path.parent], ext) + ext)
+            why = f"it's really a {tags.get('FileType', real.upper())} image"
+            if self.dry_run or root != self.working:
+                self.info(f"Would rename {self.show(path)} -> {new.name} in the working copy ({why}).")
+            else:
+                path.rename(new)
+                self.info(f"Renamed {self.show(path)} -> {new.name} ({why}).")
+
     def _prepare(self) -> Path:
-        wc = self.working
-        if wc is None:
+        working = self.working
+        if working is None:
             return self.input
+        if self.inside_working_copy:
+            self.info(f"{working} is an imfix working copy, so changing it (the originals are in {self.input}).")
 
-        if wc.has_files() and not wc.marked and self.custom_output:
-            raise click.ClickException(
-                f"{wc.root} already has files in it that imfix didn't put there. Choose an empty folder for --output."
-            )
-
-        if wc.has_files() and self.fresh:
+        if self.fresh and working.is_dir() and any(working.iterdir()):
             if self.dry_run:
-                self.info(f"Would delete the working copy in {wc.root} and start again from the originals.")
+                self.info(f"Would delete the working copy in {working} and start again from the originals.")
                 return self.input
-            shutil.rmtree(wc.root)
-            self.working = wc = WorkingCopy(wc.root)
+            # The default folder is imfix's own. A folder given with --output might not be, so ask first.
+            if self.custom_output and not click.confirm(
+                f"--fresh will delete {working} and everything in it. Continue?", default=False
+            ):
+                raise click.Abort()
+            shutil.rmtree(working)
             self.info("Deleted the old working copy.")
 
-        if wc.has_files():
-            self.info(f"Working on the copies in {wc.root} (add --fresh to start again from the originals).")
-            originals = collect(self.input, self.recurse, MEDIA_EXTS, exclude=wc.root)
-            copies = collect(wc.root, self.recurse, MEDIA_EXTS, exclude=None)
+        copies = collect(working, True, MEDIA_EXTS, exclude=None) if working.is_dir() else []
+        if copies:
+            self.info(f"Working on the copies in {working} (add --fresh to start again from the originals).")
+            # A working copy with subfolders was made with --recurse, so compare like with like.
+            made_with_recurse = any(c.parent != working for c in copies)
+            originals = collect(self.input, self.recurse or made_with_recurse, MEDIA_EXTS, exclude=working)
             if len(originals) > len(copies):
                 self.warn(f"{len(originals) - len(copies)} more file(s) in {self.input} than in the working copy. "
                           "New files aren't added automatically: use --fresh to include them.")
-            return wc.root
+            return working
 
-        sources = collect(self.input, self.recurse, MEDIA_EXTS, exclude=wc.root)
+        sources = collect(self.input, self.recurse, MEDIA_EXTS, exclude=working)
+        if not sources:
+            # Nothing to copy, so there's no working copy to change: look in DIR itself, which
+            # reports that no files were found.
+            return working if working.is_dir() else self.input
         if self.dry_run:
-            if sources:
-                self.info(f"Would copy {len(sources)} file(s) to {wc.root} and change the copies.")
+            self.info(f"Would copy {len(sources)} file(s) to {working} and change the copies.")
             return self.input
         for src in sources:
-            copy_file(src, wc.root / src.relative_to(self.input))
-        if sources:
-            wc.save()
-            self.info(f"Copied {len(sources)} file(s) to {wc.root}")
-        return wc.root
+            copy_file(src, working / src.relative_to(self.input))
+        self.info(f"Copied {len(sources)} file(s) to {working}")
+        return working
 
     def files(self, exts: set[str]) -> list[Path]:
         root = self.root
-        exclude = self.working.root if self.working and root == self.input else None
-        files = collect(root, self.recurse, exts, exclude=exclude)
+        exclude = self.working if root == self.input else None
+        # The working copy holds only what was chosen when it was made (with or without --recurse),
+        # so every file in it is included, however deep.
+        recurse = self.recurse or root == self.working
+        files = collect(root, recurse, exts, exclude=exclude)
         if not files:
-            where = "in or below" if self.recurse else "in"
-            self.info(f"No matching files found {where} {root}")
+            where = "in or below" if recurse else "in"
+            hint = ""
+            if not recurse and collect(root, True, exts, exclude=exclude):
+                hint = " There are some in subfolders: add -r to include them."
+            self.info(f"No matching files found {where} {root}.{hint}")
         else:
             self.detail(f"Found {len(files)} file(s) in {root}")
         return files
@@ -177,7 +235,7 @@ class Run:
         elif self.working is None:
             self.info(f"Done: {text}.")
         else:
-            self.info(f"Done: {text}. Results in {self.working.root}")
+            self.info(f"Done: {text}. Results in {self.working}")
 
 
 def common_options(in_place: bool = True):
@@ -192,8 +250,9 @@ def common_options(in_place: bool = True):
         options = [
             click.argument("directory", metavar="DIR", type=click.Path(exists=True, file_okay=False, path_type=Path)),
             click.option("-r", "--recurse", is_flag=True,
-                         help="Include subfolders. When the working copy is first made, this decides "
-                              "whether subfolders are copied into it."),
+                         help="Include subfolders (except ones starting with \".\") when making the working "
+                              "copy, or with --in-place. Commands on an existing working copy always include "
+                              "all of it."),
             click.option("-v", "--verbose", is_flag=True, help="Show every file and the commands being run."),
             click.option("-n", "--dry-run", is_flag=True, help="Show what would happen without changing anything."),
             click.option(
@@ -202,7 +261,8 @@ def common_options(in_place: bool = True):
                      "Give the same folder on every command.",
             ),
             click.option("--fresh", is_flag=True,
-                         help="Delete the working copy (and every change made to it) and copy the originals again."),
+                         help="Delete the working copy (and every change made to it) and copy the originals again. "
+                              "Asks first when the working copy is an --output folder."),
         ]
         if in_place:
             options.append(click.option(
@@ -249,6 +309,9 @@ def apply_metadata(run: Run, plans: list[tuple[Path, list[str] | None]], did: st
                 run.error(f"Failed: {run.show(path)}")
                 for message in errors:
                     run.error(f"    {message}")
+                if any("looks more like" in m for m in errors):
+                    run.error("    Its extension doesn't match what's inside (e.g. a WebP image named .jpg). "
+                              "imfix fixes this itself in the working copy; with --in-place, rename the file first.")
                 continue
 
             times.apply(path)
@@ -282,12 +345,16 @@ def cli(ctx: click.Context):
       3. The originals are never changed. Add --fresh to any command to
          delete the working copy and copy the originals again (do this to
          pick up files added to DIR later, or to undo everything).
+    You can also run commands from inside the working copy: "imfix compress ."
+    in DIR/imfix does the same as "imfix compress ." in DIR.
     --in-place skips the working copy and changes the originals directly.
-    Only the first command's --recurse decides whether subfolders are copied.
+    --recurse only matters when the working copy is made (or with --in-place):
+    after that, every command changes all the copies, subfolders included.
+    Folders whose names start with "." are always ignored.
 
     \b
     Every command accepts:
-      -r, --recurse    include subfolders
+      -r, --recurse    include subfolders when making the working copy
       -v, --verbose    show every file and the commands being run
       -n, --dry-run    show what would happen without changing anything
       -o, --output     use another folder as the working copy
@@ -510,13 +577,9 @@ def rename(run: Run, prefix: str | None):
         for src, dst in moves:
             temp = src.with_name(f"{TEMP_PREFIX}{uuid.uuid4().hex}{src.suffix}")
             src.rename(temp)
-            temporary.append((src, temp, dst))
-        for src, temp, dst in temporary:
+            temporary.append((temp, dst))
+        for temp, dst in temporary:
             temp.rename(dst)
-            if run.working:
-                run.working.moved(src, dst)
-        if run.working and moves:
-            run.working.save()
     else:
         counts = {"would be renamed": counts["renamed"], "already named": counts["already named"]}
     run.summary(counts)
@@ -555,10 +618,12 @@ def compress(run: Run, types: tuple[str, ...], image_format: str, image_quality:
       Video   -> MP4 with H.264 (default) or H.265
 
     Each file in the working copy is replaced by its compressed version (the originals in DIR
-    are untouched). Metadata (date taken,
-    camera, GPS, tags, audio tags and cover art) and file dates are kept unless --strip-metadata
-    is given. If a compressed file comes out bigger, the original is kept instead. Files imfix
-    has already compressed are skipped, so running this twice doesn't lose quality. This command never changes the originals, so it has no --in-place option.
+    are untouched). Metadata (date taken, camera, GPS, tags, audio tags and cover art) and file
+    dates are kept unless --strip-metadata is given. If a compressed file comes out bigger, the
+    original is kept instead.
+
+    Compressed files are marked inside the file (in the XMP history for images and video, and
+    an "imfix" tag for audio), so running this again skips them rather than losing quality.
 
     Needs ffmpeg on the PATH.
 
@@ -584,7 +649,8 @@ def compress(run: Run, types: tuple[str, ...], image_format: str, image_quality:
     if not files:
         return
     ffmpeg = find("ffmpeg", "Install it from https://ffmpeg.org (Windows: winget install ffmpeg).")
-    working = run.working
+    exiftool = ExifTool(run.verbose)
+    markers = {} if recompress else exiftool.read(files, MARKER_TAGS)
 
     counts = {"compressed": 0, "kept original": 0, "already compressed": 0, "failed": 0}
     if run.dry_run:
@@ -593,11 +659,12 @@ def compress(run: Run, types: tuple[str, ...], image_format: str, image_quality:
     # Names in use per folder, so photo.png and photo.jpg don't both become photo.jpg.
     taken: dict[Path, set[str]] = {}
     jobs = []  # (original, compressed temp file, final path, kind, times)
+    kept = []  # (original, times) for images and videos that didn't get smaller
     total_before = total_after = 0
 
     for i, src in enumerate(files, 1):
         kind = kind_of(src)
-        if working and not recompress and working.root in src.parents and working.is_compressed(src):
+        if is_marked(ExifTool.lookup(markers, src)):
             counts["already compressed"] += 1
             run.detail(f"Skipping {run.show(src)}: already compressed (use --recompress to do it again)")
             continue
@@ -639,8 +706,8 @@ def compress(run: Run, types: tuple[str, ...], image_format: str, image_quality:
             run.info(f"    {_size_change(before, after)} - kept the original")
             temp.unlink()
             counts["kept original"] += 1
-            if working:
-                working.mark_compressed(src)
+            if kind != "audio":
+                kept.append((src, times))
             continue
 
         total_before += before
@@ -649,15 +716,20 @@ def compress(run: Run, types: tuple[str, ...], image_format: str, image_quality:
         jobs.append((src, temp, final, kind, times))
 
     if not run.dry_run:
-        meta_jobs = [(temp, ["-TagsFromFile", str(src), "-all:all", "-ICC_Profile"])
-                     for src, temp, _, kind, _ in jobs if settings.copies_metadata_with_exiftool(kind)]
+        meta_jobs = [(temp, args) for src, temp, _, kind, _ in jobs
+                     if (args := settings.exiftool_args(kind, src)) is not None]
+        # Mark files that were kept as they were, so later runs don't try (and fail) to shrink them again.
+        meta_jobs += [(src, [history_entry("kept: already well compressed")]) for src, _ in kept]
         if meta_jobs:
-            run.info(f"Copying metadata for {len(meta_jobs)} file(s)...")
-            problems = ExifTool(run.verbose).write(meta_jobs)
+            run.info(f"Finishing {len(meta_jobs)} file(s) with exiftool...")
+            problems = exiftool.write(meta_jobs)
             for src, temp, final, _, _ in jobs:
                 errors = [m for m in problems.get(temp, []) if m.startswith("Error")]
                 if errors:
-                    run.warn(f"Metadata not copied to {final.name}: {errors[0]}")
+                    run.warn(f"Metadata not copied to {final.name} (and it may be compressed again next time): {errors[0]}")
+
+        for src, times in kept:
+            times.apply(src)
 
         # Swap each original for its compressed version.
         for src, temp, final, _, times in jobs:
@@ -665,12 +737,6 @@ def compress(run: Run, types: tuple[str, ...], image_format: str, image_quality:
             src.unlink()
             os.replace(temp, final)
             counts["compressed"] += 1
-            if working:
-                working.forget(src)
-                working.mark_compressed(final)
-
-        if working:
-            working.save()
 
     if total_before:
         run.info(f"Total: {_size_change(total_before, total_after)}")

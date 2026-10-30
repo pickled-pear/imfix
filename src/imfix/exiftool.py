@@ -58,12 +58,16 @@ class ExifTool:
             capture_output=True,
         )
 
-    def read(self, paths: list[Path], tags: list[str]) -> dict[str, dict]:
-        """Read `tags` from every file. Returns {normalised path: {tag: value}}."""
+    def read(self, paths: list[Path], tags: list[str], fast: bool = False) -> dict[str, dict]:
+        """Read `tags` from every file. Returns {normalised path: {tag: value}}.
+
+        `fast` reads only the start of each file, which is enough for things like the file type.
+        """
         if not paths:
             return {}
         # QuickTimeUTC: video dates are stored in UTC, so convert them to local time like photo dates.
-        lines = ["-json", "-api", "QuickTimeUTC", *(f"-{tag}" for tag in tags), *map(str, paths)]
+        lines = ["-json", "-api", "QuickTimeUTC", *(["-fast2"] if fast else []),
+                 *(f"-{tag}" for tag in tags), *map(str, paths)]
         proc = self._run(["-charset", "filename=utf8", "-@", "-"], lines)
         stdout = proc.stdout.decode("utf-8", "replace").strip()
         try:

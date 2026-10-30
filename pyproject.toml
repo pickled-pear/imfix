@@ -1,6 +1,6 @@
 [project]
 name = "imfix"
-version = "1.0.1"
+version = "1.0.4"
 description = "Batch-edit image metadata with exiftool: tags, dates, authors, copyright, renaming and compression."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -39,7 +39,7 @@ Options on every command:
 
 | Option | |
 |---|---|
-| `-r`, `--recurse` | Include subfolders |
+| `-r`, `--recurse` | Include subfolders when making the working copy, or with `--in-place` (folders starting with `.` are always ignored) |
 | `-v`, `--verbose` | Show every file and the commands being run |
 | `-n`, `--dry-run` | Show what would happen without changing anything |
 | `-o`, `--output FOLDER` | Use another folder as the working copy. Default: an `imfix` folder inside `DIR` |
@@ -67,24 +67,35 @@ Each command prints `Working on the copies in ...` when it is using an existing 
 
 Things to know:
 
+- **Running from inside the working copy.** If `DIR` is itself a folder called `imfix`, imfix
+  treats it as the working copy of the folder above. So after `cd imfix` to look at the
+  results, `imfix compress .` carries on exactly as `imfix compress ..` would, and `--fresh`
+  re-copies from the folder above. (A folder of originals that happens to be called `imfix`
+  needs `--in-place` or `-o`.)
 - **Starting again.** `--fresh` on any command deletes the working copy (and every change made
   to it) and copies the originals again before running. Deleting the `imfix` folder yourself
   does the same.
 - **New files.** Files added to `DIR` after the working copy was made aren't copied
   automatically. imfix warns you when it spots them; use `--fresh` to include them.
-- **Subfolders.** `--recurse` on the *first* command decides whether subfolders are copied
-  (keeping their layout). On later commands it decides whether the copies in subfolders are
-  changed, so use it on every command if you want subfolders included.
+- **Subfolders.** `--recurse` matters only when the working copy is made: it decides whether
+  subfolders are copied (keeping their layout). After that, every command changes all the
+  copies, however deep, with or without `--recurse`. With `--in-place`, `--recurse` decides
+  whether subfolders are changed each time. Folders whose names start with `.` (such as
+  `.thumbnails` or `.git`) are always ignored.
 - **A different folder.** `-o FOLDER` uses another folder as the working copy. Give the same
-  `-o` on every command. imfix won't use or delete a folder that already holds files it didn't
-  put there.
+  `-o` on every command. Because that folder might not be imfix's own, `--fresh` asks you to
+  confirm before deleting it (the default `imfix` folder is deleted without asking).
 - **Changing the originals.** `--in-place` skips the working copy and changes the files in `DIR`
   directly. `compress` doesn't offer it, as it replaces files.
 - **Previewing.** `--dry-run` shows what a command would do without copying or changing anything.
-- **Compressing twice.** `compress` remembers which copies it has already compressed (in
-  `imfix/.imfix.json`, which follows renames), so running it again skips them rather than
-  re-encoding and losing quality. Use `--recompress` to force it. If a file comes out bigger
-  than before, the original is kept.
+- **Nothing extra in the folder.** The working copy holds only your copied files. imfix keeps
+  no settings or record files anywhere.
+- **Compressing twice.** `compress` marks each file it compresses *inside the file*: an entry in
+  the standard XMP processing history for images and videos (visible in tools such as
+  Lightroom or exiftool), and an `imfix` tag for audio. Running `compress` again skips marked
+  files rather than re-encoding them and losing quality, even after renaming or moving them.
+  Use `--recompress` to force it. If a file comes out bigger than before, the original is kept
+  (and images and videos are marked as checked, so they aren't tried again).
 
 ## Dates from filenames
 

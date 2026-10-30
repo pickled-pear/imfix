@@ -3,14 +3,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+from imfix import __version__
 from imfix.files import AUDIO_EXTS, IMAGE_EXTS, VIDEO_EXTS
 
 AUDIO_CODECS = {"opus": "libopus", "mp3": "libmp3lame", "m4a": "aac"}
 DEFAULT_AUDIO_BITRATE = {"opus": "96k", "mp3": "160k", "m4a": "128k"}
 VIDEO_CODECS = {"h264": "libx264", "h265": "libx265"}
 PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]
+
+# Compressed files are marked inside the file itself, so imfix can tell they've already been
+# compressed (and not do it again) without keeping any record of its own. Images and videos get
+# an entry in the standard XMP processing history; audio gets an "imfix" tag written by ffmpeg.
+# These are the tags exiftool reports the markers under.
+MARKER_TAGS = ["HistorySoftwareAgent", "Imfix", "UserDefinedText"]
+
+
+def _values(value) -> list:
+    return value if isinstance(value, list) else [value]
+
+
+def is_marked(tags: dict) -> bool:
+    """Whether exiftool's `tags` (read with MARKER_TAGS) show the file was compressed by imfix."""
+    return (
+        any(str(v).startswith("imfix") for v in _values(tags.get("HistorySoftwareAgent")))
+        or tags.get("Imfix") == "compressed"                        # Opus/Ogg and M4A
+        or "(imfix) compressed" in _values(tags.get("UserDefinedText"))  # MP3
+    )
+
+
+def history_entry(parameters: str = "compressed") -> str:
+    """exiftool argument adding an imfix entry to the file's XMP history."""
+    when = datetime.now().strftime("%Y:%m:%d %H:%M:%S")
+    action = "converted" if parameters == "compressed" else "checked"
+    return f"-XMP-xmpMM:History+={{Action={action},SoftwareAgent=imfix {__version__},When={when},Parameters={parameters}}}"
 
 
 def kind_of(path: Path) -> str | None:
@@ -57,7 +85,9 @@ class Settings:
                 meta = "0:s:a:0"  # Ogg keeps its tags on the audio stream, not the file.
             else:
                 meta = "0"
-            args = [*base, "-i", str(src), "-map", "0:a:0", "-map_metadata", meta]
+            args = [*base, "-i", str(src), "-map", "0:a:0", "-map_metadata", meta, "-metadata", "imfix=compressed"]
+            if self.audio_format == "m4a":
+                args += ["-movflags", "+use_metadata_tags"]  # Otherwise M4A drops the imfix tag.
             if self.audio_format != "opus" and not self.strip_metadata:
                 # Keep cover art. ffmpeg can't put it in Opus files, so it's dropped there.
                 args += ["-map", "0:v:0?", "-c:v", "copy", "-disposition:v", "attached_pic"]
@@ -75,6 +105,10 @@ class Settings:
             "-movflags", "+faststart+use_metadata_tags", str(dst),
         ]
 
-    def copies_metadata_with_exiftool(self, kind: str) -> bool:
-        # ffmpeg already carries audio tags over, and exiftool can't write most audio formats.
-        return not self.strip_metadata and kind in ("image", "video")
+    def exiftool_args(self, kind: str, src: Path) -> list[str] | None:
+        """exiftool arguments to finish a compressed image or video: copy the original's metadata
+        across and add the imfix marker. None for audio, which ffmpeg has already finished."""
+        if kind == "audio":
+            return None
+        copy = [] if self.strip_metadata else ["-TagsFromFile", str(src), "-all:all", "-ICC_Profile"]
+        return [*copy, history_entry()]

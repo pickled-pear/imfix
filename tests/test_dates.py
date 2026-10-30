@@ -40,6 +40,10 @@ def test_date_from_filename(name, expected):
         ("2023:05:14 14:23:01.123+01:00", datetime(2023, 5, 14, 14, 23, 1)),
         ("2023:05:14", datetime(2023, 5, 14)),
         ("0000:00:00 00:00:00", None),
+        ("1904:01:01 00:00:00", None),  # QuickTime's "no date"
+        ("1903:12:31 19:00:00", None),  # ...after converting to a time zone behind UTC
+        ("1970:01:01 01:00:00", None),  # Unix's "no date"
+        ("1955:07:08 09:10:11", datetime(1955, 7, 8, 9, 10, 11)),  # old scans are still real dates
         ("", None),
         (None, None),
         (12345, None),
